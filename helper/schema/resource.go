@@ -638,6 +638,7 @@ func (r *Resource) RefreshWithoutUpgrade(
 		state = nil
 	}
 
+	schemaMap(r.Schema).handleDiffSuppressOnRefresh(s, state)
 	return r.recordCurrentSchemaVersion(state), diags
 }
 

@@ -91,7 +91,37 @@ type Schema struct {
 	// If CustomizeDiffFunc makes this field ForceNew=true, the
 	// following DiffSuppressFunc will come in with the value of old being
 	// empty, as if creating a new resource.
+	//
+	// By default, DiffSuppressFunc is considered only when deciding whether
+	// a configuration value is significantly different than the prior state
+	// value during planning. Set DiffSuppressAlways to make this rule take
+	// effect more broadly, so ResourceData.Set will ignore all attempts to
+	// set a value that's non-equal but equivalent.
 	DiffSuppressFunc SchemaDiffSuppressFunc
+
+	// DiffSuppressOnRefresh enables using the DiffSuppressFunc to undo
+	// normalization-classified changes during a "Refresh" call, in addition
+	// to the default behavior of doing so during "Diff".
+	//
+	// This is valid only for attributes of primitive types, because
+	// DiffSuppressFunc itself is only compatible with primitive types.
+	//
+	// The benefit of activating this flag is that the result of Refresh
+	// will be cleaned of normalization-only changes in the same way as the
+	// result of Diff would be, which thus prevents incorrect
+	// "Values changed outside of Terraform" noise when the remote API returns
+	// values which have the same meaning as the prior state but a different
+	// serialization.
+	//
+	// This is an opt-in because it was a later addition to the DiffSuppressFunc
+	// functionality which would cause some significant changes in behavior
+	// for existing providers if activated everywhere all at once. However,
+	// it's a particularly good choice for attributes which take strings
+	// containing "microsyntaxes" where various different values are packed
+	// together in some serialization which has many ways to express the same
+	// information, such as case-insensitive identifiers or JSON strings where
+	// the whitespace is typically insignificant.
+	DiffSuppressOnRefresh bool
 
 	// If this is non-nil, then this will be a default value that is used
 	// when this item is not set in the configuration.
@@ -759,6 +789,10 @@ func (m schemaMap) internalValidate(topSchemaMap schemaMap, attrsOnly bool) erro
 			if err != nil {
 				return fmt.Errorf("AtLeastOneOf: %+v", err)
 			}
+		}
+
+		if v.DiffSuppressOnRefresh && v.DiffSuppressFunc == nil {
+			return fmt.Errorf("%s: cannot set DiffSuppressOnRefresh without DiffSuppressFunc", k)
 		}
 
 		if v.Type == TypeList || v.Type == TypeSet {
@@ -1429,6 +1463,59 @@ func (m schemaMap) diffString(
 	}
 
 	return nil
+}
+
+// handleDiffSuppressOnRefresh visits each of the attributes set in "new" and,
+// if the corresponding schema sets both DiffSuppressFunc and
+// DiffSuppressOnRefresh, checks whether the new value is materially different
+// than the old and if not it overwrites the new value with the old one,
+// in-place.
+func (m schemaMap) handleDiffSuppressOnRefresh(old, new *terraform.InstanceState) {
+	if new == nil || old == nil {
+		return // nothing to do, then
+	}
+
+	// We'll populate this in the loop below only if we find at least one
+	// attribute which needs this analysis.
+	var d *ResourceData
+
+	oldAttrs := old.Attributes
+	newAttrs := new.Attributes
+	for k, newV := range newAttrs {
+		oldV, ok := oldAttrs[k]
+		if !ok {
+			continue // no old value to compare with
+		}
+		if newV == oldV {
+			continue // no change to test
+		}
+
+		schemaList := addrToSchema(strings.Split(k, "."), m)
+		if len(schemaList) == 0 {
+			continue // no schema? weird, but not our responsibility to handle
+		}
+		schema := schemaList[len(schemaList)-1]
+		if !schema.DiffSuppressOnRefresh || schema.DiffSuppressFunc == nil {
+			continue // not relevant
+		}
+
+		if d == nil {
+			// We populate "d" only on demand, to avoid the cost for most
+			// existing schemas where DiffSuppressAlways won't be set.
+			var err error
+			d, err = m.Data(new, nil)
+			if err != nil {
+				// Should not happen if we got far enough to be doing this
+				// analysis, but if it does then we'll bail out.
+				log.Printf("[WARN] schemaMap.handleDiffSuppressAlways failed to construct ResourceData: %s", err)
+				return
+			}
+		}
+
+		if schema.DiffSuppressFunc(k, oldV, newV, d) {
+			new.Attributes[k] = oldV // keep the old value, then
+		}
+	}
 }
 
 func (m schemaMap) validate(
